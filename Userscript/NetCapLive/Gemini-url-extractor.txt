@@ -1,0 +1,1182 @@
+// ==UserScript==
+// @name         MPD/M3U8, License & PSSH Extractor
+// @namespace    https://viayoo.com/
+// @version      0.9.3
+// @description  Extracts MPD, M3U8, License URLs, and PSSH data, grouping related items under their main manifest. Now with search, active filter, all group expansion toggles, manifest preview, improved DRM identification, PlayReady LA_URL extraction, and persistent panel state.
+// @author       You
+// @run-at       document-start
+// @match        *://*/*
+// @grant        GM_xmlhttpRequest
+// @connect      *
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    const MAX_URLS_PER_GROUP = 50; // Max items within each manifest group
+    const MAX_GROUPS = 20; // Max number of manifest groups
+    const LOCAL_STORAGE_KEY = 'urlExtractorStateV2'; // Unique key for localStorage
+
+    let loggedURLs = new Set(); // For overall deduplication
+    let groupsData = []; // Stores the structured data for display
+    let currentManifestGroup = null; // Reference to the currently active manifest group
+    let debugEnabled = false;
+    let activeFilter = 'all'; // Keep track of the currently active filter type
+    let currentSearchTerm = ''; // Keep track of the current search term
+    let customPattern = null; // User-defined regex pattern
+    let mutationObserver = null;
+    let performanceObserver = null;
+
+    // Regex patterns for URL identification
+    const urlPatterns = [
+        /\.mpd(\?|$)/i,
+        /\.m3u8(\?|$)/i,
+        /license.*\.(com|net|org|io|tv|video|api)/i, // More specific license pattern
+        /widevine/i,
+        /playready/i,
+        /fairplay/i
+    ];
+
+    // DRM System IDs (UUIDs)
+    const DRM_UUIDS = {
+        widevine: 'edef8ba979d64acea3c827dcd51d21ed',
+        playready: '9a04f07998404286ab92e65be0885f95',
+        fairplay: '94ce86f4cb4c4d3780327f3292414002'
+    };
+
+    // Helper to validate Base64 strings
+    function isValidBase64(str) {
+        if (typeof str !== 'string' || !str.trim()) return false;
+        try {
+            return btoa(atob(str)) === str && str.length < 10000;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    // --- Local Storage Management ---
+    function saveState() {
+        const state = {
+            groupsData: groupsData.map(group => ({
+                mainUrl: group.mainUrl,
+                type: group.type,
+                isExpanded: group.isExpanded,
+                items: group.items.map(item => ({ // Only store necessary item data
+                    label: item.label,
+                    value: item.value,
+                    type: item.type,
+                    color: item.color,
+                    timestamp: item.timestamp
+                }))
+            })),
+            loggedURLs: Array.from(loggedURLs),
+            debugEnabled: debugEnabled,
+            activeFilter: activeFilter,
+            currentSearchTerm: currentSearchTerm,
+            panelLeft: document.getElementById('urlExtractorPanel')?.offsetLeft,
+            panelTop: document.getElementById('urlExtractorPanel')?.offsetTop
+        };
+        try {
+            localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(state));
+            if (debugEnabled) console.log('https://www.amazon.com/extractor/s?k=extractor State saved.');
+        } catch (e) {
+            console.error('https://www.amazon.com/extractor/s?k=extractor Error saving state to localStorage:', e);
+        }
+    }
+
+    function loadState() {
+        try {
+            const savedState = JSON.parse(localStorage.getItem(LOCAL_STORAGE_KEY));
+            if (savedState) {
+                groupsData = savedState.groupsData || [];
+                loggedURLs = new Set(savedState.loggedURLs || []);
+                debugEnabled = savedState.debugEnabled || false;
+                activeFilter = savedState.activeFilter || 'all';
+                currentSearchTerm = savedState.currentSearchTerm || '';
+
+                // Restore currentManifestGroup reference if a main manifest was last added
+                if (groupsData.length > 0) {
+                    const lastGroup = groupsData[0];
+                    if (lastGroup.type === 'mpd' || lastGroup.type === 'm3u8') {
+                        currentManifestGroup = lastGroup;
+                    }
+                }
+                if (debugEnabled) console.log('https://www.amazon.com/extractor/s?k=extractor State loaded.');
+                return { panelLeft: savedState.panelLeft, panelTop: savedState.panelTop };
+            }
+        } catch (e) {
+            console.error('https://www.amazon.com/extractor/s?k=extractor Error loading state from localStorage:', e);
+            // Clear corrupted state
+            localStorage.removeItem(LOCAL_STORAGE_KEY);
+        }
+        return {}; // Return empty object if no state or error
+    }
+    // --- End Local Storage Management ---
+
+
+    // Creates the main floating panel and the circular restore button
+    function createPanel() {
+        // Remove existing panels to prevent duplicates, especially on SPA navigation
+        if (document.getElementById('urlExtractorPanel')) {
+            document.getElementById('urlExtractorPanel').remove();
+        }
+        if (document.getElementById('restorePanelBtn')) {
+            document.getElementById('restorePanelBtn').remove();
+        }
+
+        const { panelLeft, panelTop } = loadState(); // Load state before creating panel
+
+        // Main Panel Element
+        const div = document.createElement('div');
+        div.id = 'urlExtractorPanel';
+        div.setAttribute('role', 'dialog');
+        div.setAttribute('aria-labelledby', 'urlExtractorTitle');
+        div.style.cssText = `
+            position: fixed !important; bottom: 15px !important; left: 15px !important;
+            background-color: #ffffff !important; color: #333 !important; padding: 15px !important;
+            border: 1px solid #ccc !important; z-index: 2147483647 !important;
+            width: 90vw !important; max-width: 450px !important; min-width: 320px !important;
+            max-height: 60vh !important;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif !important; font-size: 14px !important;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.2) !important; border-radius: 12px !important;
+            display: flex !important; flex-direction: column !important; transition: opacity 0.3s ease, transform 0.3s ease !important;
+        `;
+
+        // Restore panel position if saved in localStorage
+        if (panelLeft && panelTop) {
+            div.style.left = `${panelLeft}px`;
+            div.style.top = `${panelTop}px`;
+            div.style.bottom = 'auto'; // Disable bottom/left when custom position is set
+        }
+
+        div.innerHTML = `
+            <div id="urlExtractorHeader" style="display:flex;justify-content:space-between;align-items:center;margin-bottom:15px;cursor:move;">
+                <h3 id="urlExtractorTitle" style="margin:0;font-size:18px;font-weight:600;" role="heading" aria-level="1">URL Extractor</h3>
+                <div id="panelControls" style="display:flex;gap:8px;">
+                     <button id="minimizeBtn" title="Minimize" aria-label="Minimize panel" style="background:none;border:none;font-size:24px;cursor:pointer;line-height:1;">&minus;</button>
+                     <button id="closeBtn" title="Close" aria-label="Close panel" style="background:none;border:none;font-size:24px;cursor:pointer;line-height:1;">&times;</button>
+                </div>
+            </div>
+            <div id="panelContent" style="display:flex;flex-direction:column;gap:12px;overflow-y:auto;">
+                <div style="display:flex;flex-wrap:wrap;gap:8px;">
+                    <button class="filter-btn" data-filter="all" aria-label="Show all URLs">All</button>
+                    <button class="filter-btn" data-filter="mpd" aria-label="Show MPD URLs">MPD</button>
+                    <button class="filter-btn" data-filter="m3u8" aria-label="Show M3U8 URLs">M3U8</button>
+                    <button class="filter-btn" data-filter="license" aria-label="Show License URLs">License</button>
+                    <button class="filter-btn" data-filter="pssh" aria-label="Show PSSH data">PSSH</button>
+                    <button class="filter-btn" data-filter="debug" aria-label="Show Debug messages">Debug</button>
+                </div>
+                <input id="searchFilterInput" type="text" placeholder="Search..." aria-label="Search filter input" style="width:calc(100% - 12px);padding:6px;border:1px solid #ccc;border-radius:6px;">
+                <input id="customPattern" type="text" placeholder="Custom regex, e.g., \\.ts$" aria-label="Custom URL regex pattern" style="width:calc(100% - 12px);padding:6px;border:1px solid #ccc;border-radius:6px;">
+                <div style="display:flex;flex-wrap:wrap;gap:8px;">
+                    <button id="expandAllBtn" aria-label="Expand all groups">Expand All</button>
+                    <button id="collapseAllBtn" aria-label="Collapse all groups">Collapse All</button>
+                </div>
+                <div id="urlGroupsContainer" style="list-style:none;padding:0;margin:0;overflow-y:auto;max-height:25vh;min-height:50px;border:1px solid #eee;border-radius:6px;" role="list">
+                    </div>
+                <div id="loading" style="display:none;color:#007bff;text-align:center;" aria-live="polite">Loading...</div>
+                <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:auto;padding-top:10px;">
+                    <button id="clearBtn" aria-label="Clear all captured URLs">Clear</button>
+                    <button id="copyBtn" aria-label="Copy all visible URLs to clipboard">Copy All</button>
+                    <button id="downloadTxtBtn" aria-label="Download visible URLs as text file">TXT</button>
+                    <button id="downloadJsonBtn" aria-label="Download visible URLs as JSON file">JSON</button>
+                    <button id="debugBtn" aria-label="Toggle debug mode">Debug: OFF</button>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(div);
+
+        // Circular Restore Button (initially hidden)
+        const restoreBtn = document.createElement('button');
+        restoreBtn.id = 'restorePanelBtn';
+        restoreBtn.title = 'Restore Panel';
+        restoreBtn.innerHTML = '&#43;'; // Plus sign icon
+        restoreBtn.style.cssText = `
+            position: fixed !important; bottom: 15px !important; left: 15px !important;
+            width: 50px !important; height: 50px !important; border-radius: 50% !important;
+            background-color: #007bff !important; color: white !important; border: none !important;
+            box-shadow: 0 4px 10px rgba(0,0,0,0.25) !important; font-size: 28px !important; font-weight: bold;
+            cursor: pointer !important; z-index: 2147483646 !important;
+            display: none !important; align-items: center !important; justify-content: center !important;
+            transition: transform 0.2s ease;
+        `;
+        // Add hover effect for restore button
+        restoreBtn.onmouseover = () => { restoreBtn.style.transform = 'scale(1.1)'; };
+        restoreBtn.onmouseout = () => { restoreBtn.style.transform = 'scale(1)'; };
+        document.body.appendChild(restoreBtn);
+
+        // Inject basic styles for panel buttons and grouping
+        const style = document.createElement('style');
+        style.textContent = `
+            #urlExtractorPanel button {
+                padding: 6px 12px; border: 1px solid #ccc; border-radius: 6px;
+                background-color: #f0f0f0; cursor: pointer; transition: all 0.2s;
+                font-size: 13px;
+            }
+            #urlExtractorPanel button:hover { background-color: #e0e0e0; }
+            #urlExtractorPanel #debugBtn {
+                background-color: ${debugEnabled ? '#ffc107' : '#f0f0f0'};
+                color: ${debugEnabled ? '#000' : '#333'};
+            }
+            #urlExtractorPanel .filter-btn.active {
+                background-color: #007bff;
+                color: white;
+                border-color: #007bff;
+            }
+            .url-group-header {
+                background-color: #e9ecef;
+                padding: 8px;
+                border-bottom: 1px solid #dee2e6;
+                cursor: pointer;
+                font-weight: bold;
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                border-radius: 6px;
+                margin-top: 5px;
+            }
+            .url-group-header:hover {
+                background-color: #dde1e5;
+            }
+            .url-group-content {
+                display: none; /* Hidden by default */
+                list-style: none;
+                padding: 0;
+                margin: 0;
+                border: 1px solid #f0f0f0;
+                border-top: none;
+                border-radius: 0 0 6px 6px;
+            }
+            .url-group-content.expanded {
+                display: block;
+            }
+            .url-group-item {
+                padding: 8px;
+                border-bottom: 1px solid #eee;
+                word-break: break-all;
+                cursor: pointer;
+                display: flex; /* Use flexbox for item layout */
+                align-items: center;
+            }
+            .url-group-item:last-child {
+                border-bottom: none;
+            }
+            .url-group-item:hover {
+                background-color: #f8f9fa;
+            }
+            .arrow {
+                font-size: 1.2em;
+                transition: transform 0.2s;
+            }
+            .arrow.expanded {
+                transform: rotate(90deg);
+            }
+            .item-actions {
+                margin-left: auto; /* Push actions to the right */
+                display: flex;
+                gap: 5px;
+            }
+            .item-action-btn {
+                background: none;
+                border: none;
+                font-size: 1.1em;
+                cursor: pointer;
+                padding: 2px 5px;
+                border-radius: 4px;
+                transition: background-color 0.2s;
+            }
+            .item-action-btn:hover {
+                background-color: #e9ecef;
+            }
+        `;
+        document.head.appendChild(style);
+
+        // Apply saved search term and active filter to inputs
+        const searchInput = document.getElementById('searchFilterInput');
+        if (searchInput) searchInput.value = currentSearchTerm;
+
+        attachEventListeners(); // Attach event listeners after panel creation
+        renderGroups(); // Render any initial data (which might be loaded from state)
+    }
+
+    // Minimizes the main panel and shows the restore button
+    function minimizePanel() {
+        const panel = document.getElementById('urlExtractorPanel');
+        const restoreBtn = document.getElementById('restorePanelBtn');
+        if (!panel || !restoreBtn) return;
+        panel.style.display = 'none';
+        restoreBtn.style.display = 'flex';
+        saveState(); // Save state when minimizing
+    }
+
+    // Restores the main panel and hides the restore button
+    function restorePanel() {
+        const panel = document.getElementById('urlExtractorPanel');
+        const restoreBtn = document.getElementById('restorePanelBtn');
+        if (!panel || !restoreBtn) return;
+        panel.style.display = 'flex';
+        restoreBtn.style.display = 'none';
+        saveState(); // Save state when restoring (though it will be saved on drag too)
+    }
+
+    // Attaches all event listeners for the panel's interactions
+    function attachEventListeners() {
+        const panel = document.getElementById('urlExtractorPanel');
+        if (!panel) return;
+
+        // Dragging functionality
+        let isDragging = false, offsetX, offsetY;
+        const header = document.getElementById('urlExtractorHeader');
+        const startDrag = (e) => {
+            isDragging = true;
+            const rect = panel.getBoundingClientRect();
+            offsetX = (e.clientX || (e.touches && e.touches[0] ? e.touches[0].clientX : 0)) - rect.left;
+            offsetY = (e.clientY || (e.touches && e.touches[0] ? e.touches[0].clientY : 0)) - rect.top;
+            panel.style.transition = 'none';
+        };
+        const drag = (e) => {
+            if (!isDragging) return;
+            e.preventDefault();
+            const x = (e.clientX || (e.touches && e.touches[0] ? e.touches[0].clientX : 0)) - offsetX;
+            const y = (e.clientY || (e.touches && e.touches[0] ? e.touches[0].clientY : 0)) - offsetY;
+
+            panel.style.left = `${Math.max(0, Math.min(x, window.innerWidth - panel.offsetWidth))}px`;
+            panel.style.top = `${Math.max(0, Math.min(y, window.innerHeight - panel.offsetHeight))}px`;
+            panel.style.bottom = 'auto'; // Important to keep it relative to top/left
+        };
+        const stopDrag = () => {
+            if (!isDragging) return;
+            isDragging = false;
+            panel.style.transition = 'opacity 0.3s ease, transform 0.3s ease';
+            saveState(); // Save position after drag ends
+        };
+
+        header.addEventListener('mousedown', startDrag);
+        document.addEventListener('mousemove', drag);
+        document.addEventListener('mouseup', stopDrag);
+        header.addEventListener('touchstart', startDrag, { passive: true });
+        document.addEventListener('touchmove', drag, { passive: false });
+        document.addEventListener('touchend', stopDrag);
+
+        // Panel controls
+        document.getElementById('minimizeBtn').addEventListener('click', minimizePanel);
+        document.getElementById('restorePanelBtn').addEventListener('click', restorePanel);
+        document.getElementById('closeBtn').addEventListener('click', () => {
+            panel.remove();
+            document.getElementById('restorePanelBtn')?.remove();
+            localStorage.removeItem(LOCAL_STORAGE_KEY); // Clear state on close
+        });
+
+        // Filter buttons
+        panel.querySelectorAll('.filter-btn').forEach(btn => btn.addEventListener('click', () => {
+            activeFilter = btn.dataset.filter;
+            filterURLs();
+            saveState(); // Save state after filter change
+        }));
+        // Search Input
+        document.getElementById('searchFilterInput').addEventListener('input', (e) => {
+            currentSearchTerm = e.target.value.toLowerCase();
+            filterURLs();
+            saveState(); // Save state after search term change
+        });
+
+        // Expand/Collapse All buttons
+        document.getElementById('expandAllBtn').addEventListener('click', () => {
+            toggleAllGroups(true);
+            saveState();
+        });
+        document.getElementById('collapseAllBtn').addEventListener('click', () => {
+            toggleAllGroups(false);
+            saveState();
+        });
+
+        // Action buttons
+        document.getElementById('clearBtn').addEventListener('click', clearURLs);
+        document.getElementById('copyBtn').addEventListener('click', copyAllURLs);
+        document.getElementById('downloadTxtBtn').addEventListener('click', () => downloadURLs('txt'));
+        document.getElementById('downloadJsonBtn').addEventListener('click', () => downloadURLs('json'));
+        document.getElementById('debugBtn').addEventListener('click', toggleDebug);
+
+        // Custom Pattern input
+        document.getElementById('customPattern').addEventListener('change', (e) => {
+            try {
+                const patternValue = e.target.value.trim();
+                if (patternValue) {
+                    // Basic sanity check to prevent too complex regex that could lead to ReDoS
+                    const start = performance.now();
+                    new RegExp(patternValue, 'i').test('a'.repeat(1000));
+                    if (performance.now() - start > 100) {
+                        throw new Error('Regex too complex, potential ReDoS risk');
+                    }
+                    customPattern = new RegExp(patternValue, 'i');
+                } else {
+                    customPattern = null;
+                }
+            } catch (err) {
+                alert(`Invalid regex: ${err.message}`);
+                e.target.value = '';
+                customPattern = null;
+            }
+            renderGroups(); // Re-render to apply new custom filter if needed
+            saveState(); // Save state after custom pattern change
+        });
+    }
+
+    // Toggles all groups to expanded or collapsed state
+    function toggleAllGroups(expand) {
+        groupsData.forEach(group => {
+            group.isExpanded = expand;
+        });
+        renderGroups();
+    }
+
+    // Toggles the debug mode
+    function toggleDebug() {
+        debugEnabled = !debugEnabled;
+        const debugBtn = document.getElementById('debugBtn');
+        if (debugBtn) {
+            debugBtn.textContent = `Debug: ${debugEnabled ? 'ON' : 'OFF'}`;
+            debugBtn.style.backgroundColor = debugEnabled ? '#ffc107' : '#f0f0f0';
+            debugBtn.style.color = debugEnabled ? '#000' : '#333';
+        }
+        console.log(`https://www.amazon.com/extractor/s?k=extractor Debug mode is now ${debugEnabled ? 'enabled' : 'disabled'}.`);
+        renderGroups(); // Re-render to show/hide debug messages
+        saveState(); // Save state after debug toggle
+    }
+
+    // Filters the displayed URLs in the list based on activeFilter and currentSearchTerm
+    function filterURLs() {
+        // Highlight active filter button
+        document.querySelectorAll('.filter-btn').forEach(btn => {
+            if (btn.dataset.filter === activeFilter) {
+                btn.classList.add('active');
+            } else {
+                btn.classList.remove('active');
+            }
+        });
+
+        document.querySelectorAll('#urlExtractorPanel .url-group-item').forEach(item => {
+            const itemType = item.dataset.type;
+            const itemText = item.innerText.toLowerCase(); // Use innerText to get full text for search
+            let showItem = true;
+
+            // Apply type filter
+            if (activeFilter !== 'all') {
+                if (activeFilter === 'debug') {
+                    showItem = (itemType === 'debug');
+                } else {
+                    showItem = (itemType === activeFilter);
+                }
+            }
+
+            // Apply search term filter
+            if (currentSearchTerm && !itemText.includes(currentSearchTerm)) {
+                showItem = false;
+            }
+
+            item.style.display = showItem ? '' : 'none';
+        });
+
+        // Show/hide entire groups based on their content visibility
+        document.querySelectorAll('#urlExtractorPanel .url-group').forEach(groupDiv => {
+            const groupItems = groupDiv.querySelectorAll('.url-group-item');
+            let hasVisibleItems = false;
+            for (const item of groupItems) {
+                if (item.style.display !== 'none') {
+                    hasVisibleItems = true;
+                    break;
+                }
+            }
+            groupDiv.style.display = hasVisibleItems ? 'block' : 'none';
+        });
+    }
+
+    // Clears all captured URLs from the list and internal set
+    function clearURLs() {
+        const container = document.getElementById('urlGroupsContainer');
+        if (container) container.innerHTML = '';
+        loggedURLs.clear();
+        groupsData.length = 0; // Clear all group data
+        currentManifestGroup = null; // Reset current group
+        if (mutationObserver) mutationObserver.disconnect();
+        if (performanceObserver) performanceObserver.disconnect();
+        setupObservers();
+        // Reset filters and search inputs
+        activeFilter = 'all';
+        currentSearchTerm = '';
+        const searchInput = document.getElementById('searchFilterInput');
+        if (searchInput) searchInput.value = '';
+        filterURLs(); // Re-apply filter to update button state
+        localStorage.removeItem(LOCAL_STORAGE_KEY); // Clear saved state
+    }
+
+    // Downloads the visible URLs as a text or JSON file
+    function downloadURLs(format) {
+        const urls = [];
+        document.querySelectorAll('#urlExtractorPanel .url-group-item:not([style*="display: none"])').forEach(li => {
+            urls.push(li.innerText);
+        });
+
+        if (urls.length === 0) return alert('No URLs to download.');
+
+        let content, filename;
+        if (format === 'json') {
+            content = JSON.stringify(urls.map(u => {
+                const parts = u.split(': ', 2);
+                return { label: parts[0], value: parts[1] || '' };
+            }), null, 2);
+            filename = 'captured_urls.json';
+        } else {
+            content = urls.join('\n');
+            filename = 'captured_urls.txt';
+        }
+
+        const blob = new Blob([content], { type: `application/${format === 'json' ? 'json' : 'plain'}` });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+    }
+
+    // Copies all visible URLs to the clipboard
+    function copyAllURLs() {
+        const urls = [];
+        document.querySelectorAll('#urlExtractorPanel .url-group-item:not([style*="display: none"])').forEach(li => {
+            urls.push(li.innerText);
+        });
+        const textToCopy = urls.join('\n');
+
+        if (!textToCopy) return alert('No URLs to copy.');
+
+        navigator.clipboard.writeText(textToCopy)
+            .then(() => alert('Copied to clipboard!'))
+            .catch(err => {
+                console.error('[Copy Error]', err);
+                // Fallback for older browsers or environments where clipboard API isn't allowed
+                const textArea = document.createElement("textarea");
+                textArea.value = textToCopy;
+                textArea.style.position = 'fixed';
+                textArea.style.top = '0';
+                textArea.style.left = '0';
+                textArea.style.width = '1px';
+                textArea.style.height = '1px';
+                textArea.style.opacity = '0';
+                document.body.appendChild(textArea);
+                textArea.focus();
+                textArea.select();
+                try {
+                    document.execCommand('copy');
+                    alert('Copied to clipboard (fallback)!');
+                } catch (e) {
+                    alert('Failed to copy. Please copy manually from the panel.');
+                }
+                document.body.removeChild(textArea);
+            });
+    }
+
+    // Fetches and displays/downloads manifest content
+    function handleManifestAction(url, actionType) {
+        if (!url) return;
+
+        // Use GM_xmlhttpRequest for cross-origin requests
+        GM_xmlhttpRequest({
+            method: "GET",
+            url: url,
+            onload: function(response) {
+                if (response.status >= 200 && response.status < 300) {
+                    const content = response.responseText;
+                    if (actionType === 'download') {
+                        const filename = url.substring(url.lastIndexOf('/') + 1) || 'manifest.txt';
+                        const blob = new Blob([content], { type: 'text/plain' });
+                        const blobUrl = URL.createObjectURL(blob);
+                        const a = document.createElement('a');
+                        a.href = blobUrl;
+                        a.download = filename;
+                        document.body.appendChild(a);
+                        a.click();
+                        document.body.removeChild(a);
+                        URL.revokeObjectURL(blobUrl);
+                        console.log(`https://www.amazon.com/extractor/s?k=extractor Downloaded: ${filename}`);
+                    } else if (actionType === 'preview') {
+                        displayPreviewModal(content, url);
+                    }
+                } else {
+                    alert(`Failed to fetch manifest from ${url}. Status: ${response.status}`);
+                    if (debugEnabled) console.error(`https://www.amazon.com/extractor/s?k=extractor Failed to fetch manifest: ${url}, Status: ${response.status}`);
+                }
+            },
+            onerror: function(error) {
+                alert(`Error fetching manifest from ${url}. See console for details.`);
+                if (debugEnabled) console.error(`https://www.amazon.com/extractor/s?k=extractor Error fetching manifest: ${url}`, error);
+            }
+        });
+    }
+
+    // Creates and displays a modal for manifest content preview
+    function displayPreviewModal(content, title) {
+        const modalId = 'manifestPreviewModal';
+        let modal = document.getElementById(modalId);
+        if (modal) modal.remove(); // Remove existing modal if any
+
+        modal = document.createElement('div');
+        modal.id = modalId;
+        modal.style.cssText = `
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background-color: rgba(0,0,0,0.7); z-index: 2147483647;
+            display: flex; justify-content: center; align-items: center;
+        `;
+
+        const modalContent = document.createElement('div');
+        modalContent.style.cssText = `
+            background-color: #fff; padding: 20px; border-radius: 8px;
+            width: 90%; max-width: 800px; height: 80%;
+            display: flex; flex-direction: column;
+        `;
+
+        const modalHeader = document.createElement('div');
+        modalHeader.style.cssText = `
+            display: flex; justify-content: space-between; align-items: center;
+            margin-bottom: 15px; border-bottom: 1px solid #eee; padding-bottom: 10px;
+        `;
+        modalHeader.innerHTML = `
+            <h4 style="margin:0;font-size:16px;">Preview: ${title.length > 80 ? title.substring(0, 77) + '...' : title}</h4>
+            <button style="background:none;border:none;font-size:24px;cursor:pointer;line-height:1;">&times;</button>
+        `;
+        modalHeader.querySelector('button').onclick = () => modal.remove();
+        modalContent.appendChild(modalHeader);
+
+        const textarea = document.createElement('textarea');
+        textarea.value = content;
+        textarea.readOnly = true;
+        textarea.style.cssText = `
+            width: 100%; height: 100%; border: 1px solid #eee; padding: 10px;
+            font-family: 'Consolas', 'Monaco', monospace; font-size: 13px;
+            resize: none; overflow: auto;
+        `;
+        modalContent.appendChild(textarea);
+
+        modal.appendChild(modalContent);
+        document.body.appendChild(modal);
+
+        // Close modal on escape key
+        const closeOnEscape = (e) => {
+            if (e.key === 'Escape') {
+                modal.remove();
+                document.removeEventListener('keydown', closeOnEscape);
+            }
+        };
+        document.addEventListener('keydown', closeOnEscape);
+    }
+
+
+    // Renders all current groups and their items into the panel
+    function renderGroups() {
+        const container = document.getElementById('urlGroupsContainer');
+        if (!container) return;
+        container.innerHTML = ''; // Clear existing
+
+        // Sort groups to ensure 'unassociated' is always at the bottom
+        const sortedGroups = [...groupsData].sort((a, b) => {
+            if (a.type === 'unassociated') return 1;
+            if (b.type === 'unassociated') return -1;
+            // Sort by latest added manifest first, then by URL for consistency
+            return groupsData.indexOf(b) - groupsData.indexOf(a) || a.mainUrl.localeCompare(b.mainUrl);
+        });
+
+        sortedGroups.forEach((group, index) => {
+            const groupDiv = document.createElement('div');
+            groupDiv.className = 'url-group';
+            groupDiv.dataset.groupId = index; // Use original index for unique ID
+
+            const header = document.createElement('div');
+            header.className = 'url-group-header';
+            header.innerHTML = `
+                <span>${group.type.toUpperCase()}: ${group.mainUrl.length > 50 && group.mainUrl !== 'N/A' ? group.mainUrl.substring(0, 47) + '...' : group.mainUrl}</span>
+                <span class="arrow ${group.isExpanded ? 'expanded' : ''}">&#9654;</span>
+            `;
+            header.onclick = () => {
+                group.isExpanded = !group.isExpanded;
+                renderGroups(); // Re-render to reflect expanded state
+                saveState(); // Save state after group expansion toggle
+            };
+            groupDiv.appendChild(header);
+
+            const contentList = document.createElement('ul');
+            contentList.className = `url-group-content ${group.isExpanded ? 'expanded' : ''}`;
+
+            // Sort items within group by timestamp (newest first)
+            const sortedItems = [...group.items].sort((a, b) => {
+                const dateA = new Date(`2000/01/01 ${a.timestamp}`); // dummy date for time comparison
+                const dateB = new Date(`2000/01/01 ${b.timestamp}`);
+                return dateB - dateA;
+            });
+
+            sortedItems.forEach(item => {
+                const li = document.createElement('li');
+                li.className = 'url-group-item';
+                li.dataset.type = item.type;
+                li.style.color = item.color;
+
+                const itemText = document.createElement('span');
+                itemText.innerHTML = `<strong>${item.label}:</strong> ${item.value} <span style="font-size:0.8em;color:#999;">(${item.timestamp})</span>`;
+                li.appendChild(itemText);
+
+                const actionsDiv = document.createElement('div');
+                actionsDiv.className = 'item-actions';
+
+                // Add manifest specific actions
+                if (item.type === 'mpd' || item.type === 'm3u8') {
+                    const previewBtn = document.createElement('button');
+                    previewBtn.className = 'item-action-btn';
+                    previewBtn.title = `Preview ${item.type.toUpperCase()}`;
+                    previewBtn.innerHTML = '&#128065;'; // Eye icon
+                    previewBtn.onclick = (e) => {
+                        e.stopPropagation(); // Prevent item click (copy)
+                        handleManifestAction(item.value, 'preview');
+                    };
+                    actionsDiv.appendChild(previewBtn);
+
+                    const downloadBtn = document.createElement('button');
+                    downloadBtn.className = 'item-action-btn';
+                    downloadBtn.title = `Download ${item.type.toUpperCase()}`;
+                    downloadBtn.innerHTML = '&#128229;'; // Download icon
+                    downloadBtn.onclick = (e) => {
+                        e.stopPropagation(); // Prevent item click (copy)
+                        handleManifestAction(item.value, 'download');
+                    };
+                    actionsDiv.appendChild(downloadBtn);
+                }
+
+                li.appendChild(actionsDiv);
+                li.setAttribute('role', 'listitem');
+                li.setAttribute('tabindex', '0');
+
+                // Original item click (copy value)
+                li.addEventListener('click', () => {
+                    navigator.clipboard.writeText(item.value)
+                        .then(() => alert('Copied item to clipboard!'))
+                        .catch(err => console.error('[Item Copy Error]', err));
+                });
+                li.addEventListener('keydown', e => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        li.click();
+                    }
+                });
+                contentList.appendChild(li);
+            });
+            groupDiv.appendChild(contentList);
+            container.appendChild(groupDiv);
+        });
+
+        filterURLs(); // Re-apply current filters after rendering
+    }
+
+    // Appends a new item to the URL list, grouping it by manifest or to an "unassociated" group
+    function appendItem(label, value, type, color = '#000', manifestUrl = null) {
+        if (loggedURLs.has(value)) return;
+        loggedURLs.add(value);
+
+        const newItem = {
+            label,
+            value,
+            type,
+            color,
+            timestamp: new Date().toLocaleTimeString()
+        };
+
+        let targetGroup = null;
+
+        if (manifestUrl) {
+            targetGroup = groupsData.find(g => g.mainUrl === manifestUrl);
+            if (!targetGroup) {
+                targetGroup = {
+                    mainUrl: manifestUrl,
+                    type: type, // mpd or m3u8
+                    items: [],
+                    isExpanded: true // New groups start expanded
+                };
+                groupsData.unshift(targetGroup); // Add to the beginning to appear higher/newer
+                if (groupsData.length > MAX_GROUPS) {
+                    const unassociatedGroup = groupsData.find(g => g.type === 'unassociated');
+                    if (unassociatedGroup) {
+                         // Move items from the oldest group to unassociated if it's not the unassociated group itself
+                         const oldestGroup = groupsData[groupsData.length -1];
+                         if (oldestGroup.type !== 'unassociated') {
+                            unassociatedGroup.items.push(...oldestGroup.items);
+                            // Ensure unassociated group stays within its limit if it grows too large
+                            if (unassociatedGroup.items.length > MAX_URLS_PER_GROUP) {
+                                unassociatedGroup.items = unassociatedGroup.items.slice(0, MAX_URLS_PER_GROUP);
+                            }
+                         }
+                    }
+                    groupsData.pop(); // Remove the oldest group
+                }
+            }
+            currentManifestGroup = targetGroup;
+        } else if (currentManifestGroup && currentManifestGroup.items.length < MAX_URLS_PER_GROUP) {
+            targetGroup = currentManifestGroup;
+        } else {
+            targetGroup = groupsData.find(g => g.type === 'unassociated');
+            if (!targetGroup) {
+                targetGroup = {
+                    mainUrl: 'N/A',
+                    type: 'unassociated',
+                    items: [],
+                    isExpanded: true
+                };
+                groupsData.push(targetGroup); // Unassociated always at the end
+            }
+        }
+
+        if (targetGroup) {
+            targetGroup.items.unshift(newItem); // Add to the beginning of items list (newest first)
+            if (targetGroup.items.length > MAX_URLS_PER_GROUP) {
+                targetGroup.items.pop(); // Remove oldest item
+            }
+        }
+
+        renderGroups(); // Re-render the UI
+        saveState(); // Save state after appending an item
+    }
+
+    // Logs a URL if it matches any pattern
+    function logURL(method, url) {
+        if (typeof url !== 'string' || !url.trim() || url.startsWith('data:')) return;
+
+        const patterns = [...urlPatterns, customPattern].filter(Boolean);
+        const isManifest = /\.mpd(\?|$)/i.test(url) || /\.m3u8(\?|$)/i.test(url);
+        const isLicense = /license.*\.(com|net|org|io|tv|video|api)|widevine|playready|fairplay/i.test(url);
+
+        if (patterns.some(p => p.test(url))) {
+            let type = 'other';
+            let color = '#000';
+            if (isManifest) {
+                type = /\.mpd(\?|$)/i.test(url) ? 'mpd' : 'm3u8';
+                color = type === 'mpd' ? '#007bff' : '#28a745';
+                appendItem(type.toUpperCase(), url, type, color, url);
+            } else if (isLicense) {
+                type = 'license';
+                color = '#dc3545';
+                appendItem('License', url, type, color);
+            } else {
+                appendItem(method, url, type, color);
+            }
+        } else if (debugEnabled) {
+            appendItem('Skipped', url, 'debug', '#6c757d');
+        }
+    }
+
+    // Parses PSSH data from an ArrayBuffer (e.g., from MP4 boxes)
+    function parsePSSH(data) {
+        if (!(data instanceof ArrayBuffer) || data.byteLength < 12) return null;
+        const view = new DataView(data);
+        const size = view.getUint32(0, false);
+        const boxType = String.fromCharCode(view.getUint8(4), view.getUint8(5), view.getUint8(6), view.getUint8(7));
+        if (size !== view.byteLength || boxType !== 'pssh') return null;
+
+        const version = view.getUint8(8);
+        const systemIdArray = new Uint8Array(data.slice(12, 28));
+        const systemIdHex = Array.from(systemIdArray).map(b => b.toString(16).padStart(2, '0')).join('');
+
+        let drmSystem = 'Unknown';
+        let keyIds = null;
+        let psshDataBlob = null; // To store the system-specific data part of PSSH
+
+        let offset = 28; // After SystemID (16 bytes) and Version (1 byte) + Flags (3 bytes)
+
+        if (version === 1) {
+            const KIDsCount = view.getUint32(offset, false);
+            offset += 4;
+            keyIds = [];
+            for (let i = 0; i < KIDsCount; i++) {
+                if (offset + 16 <= view.byteLength) {
+                    const keyId = new Uint8Array(data.slice(offset, offset + 16));
+                    keyIds.push(Array.from(keyId).map(b => b.toString(16).padStart(2, '0')).join(''));
+                    offset += 16;
+                }
+            }
+        }
+
+        // Get PSSH Data Size (DataSize field exists in both v0 and v1)
+        if (offset + 4 <= view.byteLength) {
+            const dataSize = view.getUint32(offset, false);
+            offset += 4;
+            if (offset + dataSize <= view.byteLength) {
+                psshDataBlob = data.slice(offset, offset + dataSize);
+            }
+        }
+
+        if (systemIdHex === DRM_UUIDS.widevine) {
+            drmSystem = 'Widevine';
+        } else if (systemIdHex === DRM_UUIDS.playready) {
+            drmSystem = 'PlayReady';
+        } else if (systemIdHex === DRM_UUIDS.fairplay) {
+            drmSystem = 'FairPlay';
+        }
+
+        return { system: drmSystem, systemId: systemIdHex, keyIds, psshDataBlob };
+    }
+
+    // Converts a Uint8Array (typically PlayReady PSSH blob) to a UTF-16LE string
+    function uint8ArrayToUTF16LEString(uint8Array) {
+        // PlayReady XML is typically UTF-16LE. The BOM (Byte Order Mark) 0xFF 0xFE
+        // might be present or absent. If present, TextDecoder handles it.
+        // If the data is an odd number of bytes, it's malformed UTF-16.
+        if (uint8Array.byteLength % 2 !== 0) {
+            if (debugEnabled) console.warn('https://www.amazon.com/extractor/s?k=extractor PlayReady PSSH blob has odd length, likely malformed UTF-16LE.');
+            return null;
+        }
+        try {
+            return new TextDecoder('utf-16le', { fatal: true }).decode(uint8Array);
+        } catch (e) {
+            if (debugEnabled) console.warn('https://www.amazon.com/extractor/s?k=extractor Failed to decode PlayReady PSSH as UTF-16LE:', e);
+            return null;
+        }
+    }
+
+    // Scans text or ArrayBuffer data for PSSH XML tags or raw PSSH box data
+    function scanForPSSH(data, method) {
+        if (!data) return;
+
+        // 1. Scan for XML-encoded PSSH (e.g., in MPD manifests)
+        try {
+            const text = typeof data === 'string' ? data : new TextDecoder('utf-8', { fatal: false }).decode(data);
+            const matches = text.match(/<cenc:pssh>([^<]+)<\/cenc:pssh>/g) || [];
+            matches.forEach(match => {
+                const base64 = match.replace(/<\/?cenc:pssh>/g, '');
+                if (isValidBase64(base64)) {
+                    appendItem(`PSSH (${method})`, base64, 'pssh', '#800080');
+                    try {
+                        const binary = atob(base64);
+                        const psshArrayBuffer = new Uint8Array(binary.length);
+                        for (let i = 0; i < binary.length; i++) psshArrayBuffer[i] = binary.charCodeAt(i);
+                        const parsed = parsePSSH(psshArrayBuffer.buffer);
+                        if (parsed) {
+                            appendItem(`${parsed.system} System ID (${method})`, parsed.systemId, 'pssh', '#8A2BE2'); // BlueViolet for SystemID
+                            if (parsed.keyIds && parsed.keyIds.length) {
+                                appendItem(`${parsed.system} Key IDs (${method})`, parsed.keyIds.join(', '), 'pssh', '#9932CC');
+                            }
+                            // PlayReady specific parsing
+                            if (parsed.system === 'PlayReady' && parsed.psshDataBlob) {
+                                const playreadyXmlString = uint8ArrayToUTF16LEString(new Uint8Array(parsed.psshDataBlob));
+                                if (playreadyXmlString) {
+                                    appendItem(`PlayReady PRO XML (${method})`, playreadyXmlString, 'pssh', '#4B0082'); // Indigo
+                                    // Attempt to extract LA_URL
+                                    const laUrlMatch = playreadyXmlString.match(/<LA_URL>(.*?)<\/LA_URL>/i);
+                                    if (laUrlMatch && laUrlMatch[1]) {
+                                        appendItem(`PlayReady LA_URL (${method})`, laUrlMatch[1], 'license', '#A52A2A'); // Brown
+                                    }
+                                }
+                            }
+                        }
+                    } catch (e) {
+                        if (debugEnabled) console.warn('[PSSH Base64 Decode/Parse Error]', e);
+                    }
+                }
+            });
+        } catch (error) {
+            if (debugEnabled) console.warn('[PSSH XML Scan Error]:', error);
+        }
+
+        // 2. Scan for raw PSSH boxes within binary data (e.g., fMP4 init segments)
+        if (data instanceof ArrayBuffer) {
+            try {
+                const view = new DataView(data);
+                let offset = 0;
+                while (offset + 8 <= view.byteLength) {
+                    const currentBoxSize = view.getUint32(offset, false);
+                    const currentBoxType = String.fromCharCode(view.getUint8(offset + 4), view.getUint8(offset + 5), view.getUint8(offset + 6), view.getUint8(offset + 7));
+
+                    if (currentBoxType === 'pssh' && currentBoxSize >= 20 && offset + currentBoxSize <= view.byteLength) {
+                        const psshBoxData = data.slice(offset, offset + currentBoxSize);
+                        const base64 = btoa(String.fromCharCode(...new Uint8Array(psshBoxData)));
+                        if (isValidBase64(base64)) {
+                            const parsed = parsePSSH(psshBoxData);
+                            if (parsed) {
+                                appendItem(`${parsed.system} PSSH (${method})`, base64, 'pssh', '#800080'); // Use identified DRM system
+                                appendItem(`${parsed.system} System ID (${method})`, parsed.systemId, 'pssh', '#8A2BE2');
+                                if (parsed.keyIds && parsed.keyIds.length) {
+                                    appendItem(`${parsed.system} Key IDs (${method})`, parsed.keyIds.join(', '), 'pssh', '#9932CC');
+                                }
+                                // PlayReady specific parsing for binary PSSH
+                                if (parsed.system === 'PlayReady' && parsed.psshDataBlob) {
+                                    const playreadyXmlString = uint8ArrayToUTF16LEString(new Uint8Array(parsed.psshDataBlob));
+                                    if (playreadyXmlString) {
+                                        appendItem(`PlayReady PRO XML (${method})`, playreadyXmlString, 'pssh', '#4B0082');
+                                        const laUrlMatch = playreadyXmlString.match(/<LA_URL>(.*?)<\/LA_URL>/i);
+                                        if (laUrlMatch && laUrlMatch[1]) {
+                                            appendItem(`PlayReady LA_URL (${method})`, laUrlMatch[1], 'license', '#A52A2A');
+                                        }
+                                    }
+                                }
+                            } else {
+                                appendItem(`Raw PSSH (Unknown DRM - ${method})`, base64, 'pssh', '#800080'); // Fallback if parsePSSH fails
+                            }
+                        }
+                    }
+                    // Prevent infinite loop if size is 0 or invalid
+                    if (currentBoxSize === 0) break;
+                    offset += currentBoxSize;
+                }
+            } catch (error) {
+                if (debugEnabled) console.warn('[PSSH Binary Scan Error]:', error);
+            }
+        }
+    }
+
+    // Sets up MutationObserver and PerformanceObserver
+    function setupObservers() {
+        if (mutationObserver) mutationObserver.disconnect();
+        mutationObserver = new MutationObserver(mutations => {
+            mutations.forEach(mutation => {
+                mutation.addedNodes.forEach(node => {
+                    if (node.tagName === 'VIDEO' || node.tagName === 'AUDIO') {
+                        if (node.src) logURL('Media Element', node.src);
+                        node.querySelectorAll('source').forEach(source => {
+                            if (source.src) logURL('Media Source', source.src);
+                        });
+                    }
+                });
+            });
+        });
+        mutationObserver.observe(document.documentElement, { childList: true, subtree: true });
+
+        if (window.PerformanceObserver) {
+            if (performanceObserver) performanceObserver.disconnect();
+            performanceObserver = new PerformanceObserver(list => {
+                list.getEntries().forEach(entry => {
+                    // Only log resource entries, and check if it's a URL we care about
+                    if (entry.initiatorType === 'fetch' || entry.initiatorType === 'xmlhttprequest') {
+                        // Check if it's a manifest or license URL, or matches custom pattern
+                        const isManifestOrLicense = urlPatterns.slice(0, 3).some(p => p.test(entry.name)); // Check only manifest/license
+                        const isCustom = customPattern && customPattern.test(entry.name);
+                        if (isManifestOrLicense || isCustom) {
+                             logURL(entry.initiatorType.toUpperCase(), entry.name);
+                        } else if (debugEnabled) {
+                             appendItem('Resource', entry.name, 'debug', '#6c757d');
+                        }
+                    }
+                });
+            });
+            performanceObserver.observe({ entryTypes: ['resource'] });
+        }
+    }
+
+    // Intercept Fetch API calls
+    const originalFetch = window.fetch;
+    window.fetch = async function(input, init) {
+        const url = typeof input === 'string' ? input : (input && input.url ? input.url : '');
+        const loading = document.getElementById('loading');
+        if (loading) loading.style.display = 'block';
+
+        try {
+            const response = await originalFetch(input, init);
+            // Log only if it matches patterns, otherwise it's logged by PerformanceObserver
+            if (urlPatterns.some(p => p.test(url)) || (customPattern && customPattern.test(url))) {
+                 logURL('Fetch', url);
+            } else if (debugEnabled) {
+                 appendItem('Fetch (raw)', url, 'debug', '#6c757d');
+            }
+
+            if (response.ok) {
+                const clonedResponse = response.clone();
+                clonedResponse.arrayBuffer()
+                    .then(buffer => scanForPSSH(buffer, 'Fetch'))
+                    .catch(e => {
+                        if (debugEnabled) console.warn('https://www.amazon.com/extractor/s?k=extractor Fetch response body (ArrayBuffer) error:', e);
+                    });
+            }
+            return response;
+        } catch (error) {
+            if (debugEnabled) {
+                console.error('https://www.amazon.com/extractor/s?k=extractor Fetch Error:', `URL: ${url}`, error);
+                appendItem('Fetch Error', url, 'error', '#dc3545');
+            }
+            throw error;
+        } finally {
+            if (loading) loading.style.display = 'none';
+        }
+    };
+
+    // Intercept XMLHttpRequest calls
+    const originalXhrOpen = XMLHttpRequest.prototype.open;
+    const originalXhrSend = XMLHttpRequest.prototype.send;
+
+    XMLHttpRequest.prototype.open = function(method, url) {
+        this._url = url;
+        originalXhrOpen.apply(this, arguments);
+    };
+
+    XMLHttpRequest.prototype.send = function() {
+        const loading = document.getElementById('loading');
+        if (loading) loading.style.display = 'block';
+
+        this.addEventListener('load', function() {
+            try {
+                if (this.status >= 200 && this.status < 300) {
+                    // Log only if it matches patterns, otherwise it's logged by PerformanceObserver
+                    if (urlPatterns.some(p => p.test(this._url)) || (customPattern && customPattern.test(this._url))) {
+                        logURL('XHR', this._url);
+                    } else if (debugEnabled) {
+                        appendItem('XHR (raw)', this._url, 'debug', '#6c757d');
+                    }
+
+                    if (this.responseType === '' || this.responseType === 'text') {
+                        if (this.responseText) scanForPSSH(this.responseText, 'XHR');
+                    } else if (this.responseType === 'arraybuffer' && this.response) {
+                        scanForPSSH(this.response, 'XHR');
+                    }
+                }
+            } catch (e) {
+                if (debugEnabled) console.error('https://www.amazon.com/extractor/s?k=extractor XHR Load Error:', e);
+            } finally {
+                if (loading) loading.style.display = 'none';
+            }
+        });
+        this.addEventListener('error', function() {
+            if (debugEnabled) {
+                console.error('https://www.amazon.com/extractor/s?k=extractor XHR Network Error:', this._url);
+                appendItem('XHR Error', this._url, 'error', '#dc3545');
+            }
+            if (loading) loading.style.display = 'none';
+        });
+        originalXhrSend.apply(this, arguments);
+    };
+
+    // Ensure panel creation and observer setup on various document states and events
+    function initializeScript() {
+        // Create panel and setup observers on DOMContentLoaded or immediately if ready
+        if (document.readyState === 'interactive' || document.readyState === 'complete') {
+            createPanel();
+            setupObservers();
+        } else {
+            document.addEventListener('DOMContentLoaded', () => {
+                createPanel();
+                setupObservers();
+            });
+        }
+
+        // Also ensure panel and observers on window load, as some resources might load late
+        window.addEventListener('load', () => {
+            createPanel();
+            setupObservers();
+        });
+
+        // Clear and re-initialize on SPA navigation (hashchange, popstate)
+        window.addEventListener('popstate', () => {
+            clearURLs(); // This also clears localStorage state
+            createPanel();
+        });
+        window.addEventListener('hashchange', () => {
+            clearURLs(); // This also clears localStorage state
+            createPanel();
+        });
+    }
+
+    initializeScript();
+})();

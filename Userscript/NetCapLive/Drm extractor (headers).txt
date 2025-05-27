@@ -1,0 +1,998 @@
+// ==UserScript==
+// @name         DRM Extractor
+// @namespace    https://viayoo.com/
+// @version      0.9.1
+// @description  Extracts MPD, M3U8, License URLs, and PSSH data, grouping related items under their main manifest, and shows response headers.
+// @author       You
+// @run-at       document-start
+// @match        *://*/*
+// @grant        none
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    const MAX_URLS_PER_GROUP = 50; // Max items within each manifest group
+    const MAX_GROUPS = 20; // Max number of manifest groups
+    const loggedURLs = new Set(); // For overall deduplication
+    const groupsData = []; // Stores the structured data for display
+    let currentManifestGroup = null; // Reference to the currently active manifest group
+    let debugEnabled = false;
+
+    // Regex patterns for URL identification
+    const urlPatterns = [
+        /\.mpd(\?|$)/i,
+        /\.m3u8(\?|$)/i,
+        /license.*\.(com|net|org|io|tv|video|api)/i,
+        /widevine/i,
+        /playready/i,
+        /fairplay/i
+    ];
+    let customPattern = null; // User-defined regex pattern
+    let mutationObserver = null;
+    let performanceObserver = null;
+
+    // Helper to validate Base64 strings
+    function isValidBase64(str) {
+        if (typeof str !== 'string' || !str.trim()) return false;
+        try {
+            return btoa(atob(str)) === str && str.length < 10000;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    // Creates the main floating panel and the circular restore button
+    function createPanel() {
+        // Remove existing panels to prevent duplicates, especially on SPA navigation
+        if (document.getElementById('urlExtractorPanel')) {
+            document.getElementById('urlExtractorPanel').remove();
+        }
+        if (document.getElementById('restorePanelBtn')) {
+            document.getElementById('restorePanelBtn').remove();
+        }
+
+        // Main Panel Element
+        const div = document.createElement('div');
+        div.id = 'urlExtractorPanel';
+        div.setAttribute('role', 'dialog');
+        div.setAttribute('aria-labelledby', 'urlExtractorTitle');
+        div.style.cssText = `
+            position: fixed !important; bottom: 15px !important; left: 15px !important;
+            background-color: #ffffff !important; color: #333 !important; padding: 15px !important;
+            border: 1px solid #ccc !important; z-index: 2147483647 !important;
+            width: 90vw !important; max-width: 450px !important; min-width: 320px !important;
+            max-height: 60vh !important;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif !important; font-size: 14px !important;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.2) !important; border-radius: 12px !important;
+            display: flex !important; flex-direction: column !important; transition: opacity 0.3s ease, transform 0.3s ease !important;
+        `;
+
+        // Restore panel position if saved in localStorage
+        const savedState = JSON.parse(localStorage.getItem('urlExtractorState') || '{}');
+        if (savedState.left && savedState.top) {
+            div.style.left = `${savedState.left}px`;
+            div.style.top = `${savedState.top}px`;
+            div.style.bottom = 'auto'; // Disable bottom/left when custom position is set
+        }
+
+        div.innerHTML = `
+            <div id="urlExtractorHeader" style="display:flex;justify-content:space-between;align-items:center;margin-bottom:15px;cursor:move;">
+                <h3 id="urlExtractorTitle" style="margin:0;font-size:18px;font-weight:600;" role="heading" aria-level="1">URL Extractor</h3>
+                <div id="panelControls" style="display:flex;gap:8px;">
+                     <button id="minimizeBtn" title="Minimize" aria-label="Minimize panel" style="background:none;border:none;font-size:24px;cursor:pointer;line-height:1;">&minus;</button>
+                     <button id="closeBtn" title="Close" aria-label="Close panel" style="background:none;border:none;font-size:24px;cursor:pointer;line-height:1;">&times;</button>
+                </div>
+            </div>
+            <div id="panelContent" style="display:flex;flex-direction:column;gap:12px;overflow-y:auto;">
+                <div style="display:flex;flex-wrap:wrap;gap:8px;">
+                    <button class="filter-btn" data-filter="all" aria-label="Show all URLs">All</button>
+                    <button class="filter-btn" data-filter="mpd" aria-label="Show MPD URLs">MPD</button>
+                    <button class="filter-btn" data-filter="m3u8" aria-label="Show M3U8 URLs">M3U8</button>
+                    <button class="filter-btn" data-filter="license" aria-label="Show License URLs">License</button>
+                    <button class="filter-btn" data-filter="pssh" aria-label="Show PSSH data">PSSH</button>
+                    <button class="filter-btn" data-filter="debug" aria-label="Show Debug messages">Debug</button>
+                    <button class="filter-btn" data-filter="fetch" aria-label="Show Fetch URLs">Fetch</button>
+                    <button class="filter-btn" data-filter="xhr" aria-label="Show XHR URLs">XHR</button>
+                </div>
+                <input id="customPattern" type="text" placeholder="Custom regex, e.g., \\.ts$" aria-label="Custom URL regex pattern" style="width:calc(100% - 12px);padding:6px;border:1px solid #ccc;border-radius:6px;">
+                <div id="urlGroupsContainer" style="list-style:none;padding:0;margin:0;overflow-y:auto;max-height:25vh;min-height:50px;border:1px solid #eee;border-radius:6px;" role="list">
+                    </div>
+                <div id="loading" style="display:none;color:#007bff;text-align:center;" aria-live="polite">Loading...</div>
+                <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:auto;padding-top:10px;">
+                    <button id="clearBtn" aria-label="Clear all captured URLs">Clear</button>
+                    <button id="copyBtn" aria-label="Copy all visible URLs to clipboard">Copy All</button>
+                    <button id="downloadTxtBtn" aria-label="Download visible URLs as text file">TXT</button>
+                    <button id="downloadJsonBtn" aria-label="Download visible URLs as JSON file">JSON</button>
+                    <button id="debugBtn" aria-label="Toggle debug mode">Debug: OFF</button>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(div);
+
+        // Circular Restore Button (initially hidden)
+        const restoreBtn = document.createElement('button');
+        restoreBtn.id = 'restorePanelBtn';
+        restoreBtn.title = 'Restore Panel';
+        restoreBtn.innerHTML = '&#43;'; // Plus sign icon
+        restoreBtn.style.cssText = `
+            position: fixed !important; bottom: 15px !important; left: 15px !important;
+            width: 50px !important; height: 50px !important; border-radius: 50% !important;
+            background-color: #007bff !important; color: white !important; border: none !important;
+            box-shadow: 0 4px 10px rgba(0,0,0,0.25) !important; font-size: 28px !important; font-weight: bold;
+            cursor: pointer !important; z-index: 2147483646 !important;
+            display: none !important; align-items: center !important; justify-content: center !important;
+            transition: transform 0.2s ease;
+        `;
+        // Add hover effect for restore button
+        restoreBtn.onmouseover = () => { restoreBtn.style.transform = 'scale(1.1)'; };
+        restoreBtn.onmouseout = () => { restoreBtn.style.transform = 'scale(1)'; };
+        document.body.appendChild(restoreBtn);
+
+        // Inject basic styles for panel buttons and grouping
+        const style = document.createElement('style');
+        style.textContent = `
+            #urlExtractorPanel button {
+                padding: 6px 12px; border: 1px solid #ccc; border-radius: 6px;
+                background-color: #f0f0f0; cursor: pointer; transition: all 0.2s;
+                font-size: 13px;
+            }
+            #urlExtractorPanel button:hover { background-color: #e0e0e0; }
+            #urlExtractorPanel #debugBtn {
+                background-color: ${debugEnabled ? '#ffc107' : '#f0f0f0'};
+                color: ${debugEnabled ? '#000' : '#333'};
+            }
+            .url-group-header {
+                background-color: #e9ecef;
+                padding: 8px;
+                border-bottom: 1px solid #dee2e6;
+                cursor: pointer;
+                font-weight: bold;
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                border-radius: 6px;
+                margin-top: 5px;
+            }
+            .url-group-header:hover {
+                background-color: #dde1e5;
+            }
+            .url-group-content {
+                display: none; /* Hidden by default */
+                list-style: none;
+                padding: 0;
+                margin: 0;
+                border: 1px solid #f0f0f0;
+                border-top: none;
+                border-radius: 0 0 6px 6px;
+            }
+            .url-group-content.expanded {
+                display: block;
+            }
+            .url-group-item {
+                padding: 8px;
+                border-bottom: 1px solid #eee;
+                word-break: break-all;
+                cursor: pointer;
+            }
+            .url-group-item:last-child {
+                border-bottom: none;
+            }
+            .url-group-item:hover {
+                background-color: #f8f9fa;
+            }
+            .arrow {
+                font-size: 1.2em;
+                transition: transform 0.2s;
+            }
+            .arrow.expanded {
+                transform: rotate(90deg);
+            }
+        `;
+        document.head.appendChild(style);
+
+        attachEventListeners(); // Attach event listeners after panel creation
+        renderGroups(); // Render any initial data
+    }
+
+    // Minimizes the main panel and shows the restore button
+    function minimizePanel() {
+        const panel = document.getElementById('urlExtractorPanel');
+        const restoreBtn = document.getElementById('restorePanelBtn');
+        if (!panel || !restoreBtn) return;
+        panel.style.display = 'none';
+        restoreBtn.style.display = 'flex';
+    }
+
+    // Restores the main panel and hides the restore button
+    function restorePanel() {
+        const panel = document.getElementById('urlExtractorPanel');
+        const restoreBtn = document.getElementById('restorePanelBtn');
+        if (!panel || !restoreBtn) return;
+        panel.style.display = 'flex';
+        restoreBtn.style.display = 'none';
+    }
+
+    // Attaches all event listeners for the panel's interactions
+    function attachEventListeners() {
+        const panel = document.getElementById('urlExtractorPanel');
+        if (!panel) return;
+
+        // Dragging functionality
+        let isDragging = false, offsetX, offsetY;
+        const header = document.getElementById('urlExtractorHeader');
+        const startDrag = (e) => {
+            isDragging = true;
+            const rect = panel.getBoundingClientRect();
+            offsetX = (e.clientX || (e.touches && e.touches[0] ? e.touches[0].clientX : 0)) - rect.left;
+            offsetY = (e.clientY || (e.touches && e.touches[0] ? e.touches[0].clientY : 0)) - rect.top;
+            panel.style.transition = 'none';
+        };
+        const drag = (e) => {
+            if (!isDragging) return;
+            e.preventDefault();
+            const x = (e.clientX || (e.touches && e.touches[0] ? e.touches[0].clientX : 0)) - offsetX;
+            const y = (e.clientY || (e.touches && e.touches[0] ? e.touches[0].clientY : 0)) - offsetY;
+
+            panel.style.left = `${Math.max(0, Math.min(x, window.innerWidth - panel.offsetWidth))}px`;
+            panel.style.top = `${Math.max(0, Math.min(y, window.innerHeight - panel.offsetHeight))}px`;
+            panel.style.bottom = 'auto';
+        };
+        const stopDrag = () => {
+            if (!isDragging) return;
+            isDragging = false;
+            panel.style.transition = 'opacity 0.3s ease, transform 0.3s ease';
+            localStorage.setItem('urlExtractorState', JSON.stringify({ left: panel.offsetLeft, top: panel.offsetTop }));
+        };
+
+        header.addEventListener('mousedown', startDrag);
+        document.addEventListener('mousemove', drag);
+        document.addEventListener('mouseup', stopDrag);
+        header.addEventListener('touchstart', startDrag, { passive: true });
+        document.addEventListener('touchmove', drag, { passive: false });
+        document.addEventListener('touchend', stopDrag);
+
+        // Panel controls
+        document.getElementById('minimizeBtn').addEventListener('click', minimizePanel);
+        document.getElementById('restorePanelBtn').addEventListener('click', restorePanel);
+        document.getElementById('closeBtn').addEventListener('click', () => {
+            panel.remove();
+            document.getElementById('restorePanelBtn')?.remove();
+        });
+
+        // Filter buttons
+        panel.querySelectorAll('.filter-btn').forEach(btn => btn.addEventListener('click', () => filterURLs(btn.dataset.filter)));
+        // Action buttons
+        document.getElementById('clearBtn').addEventListener('click', clearURLs);
+        document.getElementById('copyBtn').addEventListener('click', copyAllURLs);
+        document.getElementById('downloadTxtBtn').addEventListener('click', () => downloadURLs('txt'));
+        document.getElementById('downloadJsonBtn').addEventListener('click', () => downloadURLs('json'));
+        document.getElementById('debugBtn').addEventListener('click', toggleDebug);
+
+        // Custom Pattern input
+        document.getElementById('customPattern').addEventListener('change', (e) => {
+            try {
+                const patternValue = e.target.value.trim();
+                if (patternValue) {
+                    const start = performance.now();
+                    new RegExp(patternValue, 'i').test('a'.repeat(1000));
+                    if (performance.now() - start > 100) {
+                        throw new Error('Regex too complex, potential ReDoS risk');
+                    }
+                    customPattern = new RegExp(patternValue, 'i');
+                } else {
+                    customPattern = null;
+                }
+            } catch (err) {
+                alert(`Invalid regex: ${err.message}`);
+                e.target.value = '';
+                customPattern = null;
+            }
+            renderGroups(); // Re-render to apply new custom filter if needed
+        });
+    }
+
+    // Toggles the debug mode
+    function toggleDebug() {
+        debugEnabled = !debugEnabled;
+        const debugBtn = document.getElementById('debugBtn');
+        if (debugBtn) {
+            debugBtn.textContent = `Debug: ${debugEnabled ? 'ON' : 'OFF'}`;
+            debugBtn.style.backgroundColor = debugEnabled ? '#ffc107' : '#f0f0f0';
+            debugBtn.style.color = debugEnabled ? '#000' : '#333';
+        }
+        console.log(`DRM Extractor Debug mode is now ${debugEnabled ? 'enabled' : 'disabled'}.`);
+        renderGroups(); // Re-render to show/hide debug messages
+    }
+
+    // Filters the displayed URLs in the list
+    function filterURLs(type) {
+        document.querySelectorAll('#urlExtractorPanel .url-group-item').forEach(item => {
+            const itemType = item.dataset.type;
+            item.style.display = (type === 'all' || itemType === type) ? '' : 'none';
+        });
+
+        // Show/hide entire groups based on their content visibility
+        document.querySelectorAll('#urlExtractorPanel .url-group').forEach(groupDiv => {
+            const groupItems = groupDiv.querySelectorAll('.url-group-item');
+            let hasVisibleItems = false;
+            for (const item of groupItems) {
+                if (item.style.display !== 'none') {
+                    hasVisibleItems = true;
+                    break;
+                }
+            }
+            groupDiv.style.display = hasVisibleItems ? 'block' : 'none';
+        });
+    }
+
+    // Clears all captured URLs from the list and internal set
+    function clearURLs() {
+        const container = document.getElementById('urlGroupsContainer');
+        if (container) container.innerHTML = '';
+        loggedURLs.clear();
+        groupsData.length = 0; // Clear all group data
+        currentManifestGroup = null; // Reset current group
+        if (mutationObserver) mutationObserver.disconnect();
+        if (performanceObserver) performanceObserver.disconnect();
+        setupObservers();
+    }
+
+    // Downloads the visible URLs as a text or JSON file
+    function downloadURLs(format) {
+        const urls = [];
+        document.querySelectorAll('#urlExtractorPanel .url-group-item:not([style*="display: none"])').forEach(li => {
+            // Extract only the URL/value part, excluding label and timestamp
+            const valueMatch = li.innerText.match(/:\s*(.*?)\s*\(\d{1,2}:\d{2}:\d{2}\s*(?:AM|PM)\)/);
+            if (valueMatch && valueMatch[1]) {
+                urls.push(valueMatch[1]);
+            } else {
+                urls.push(li.innerText); // Fallback if regex fails
+            }
+        });
+
+        if (urls.length === 0) return alert('No URLs to download.');
+
+        let content, filename;
+        if (format === 'json') {
+            content = JSON.stringify(urls.map(u => {
+                const parts = u.split(': ', 2);
+                return { label: parts[0], value: parts[1] || '' };
+            }), null, 2);
+            filename = 'captured_urls.json';
+        } else {
+            content = urls.join('\n');
+            filename = 'captured_urls.txt';
+        }
+
+        const blob = new Blob([content], { type: `application/${format === 'json' ? 'json' : 'plain'}` });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+    }
+
+    // Copies all visible URLs to the clipboard
+    function copyAllURLs() {
+        const urls = [];
+        document.querySelectorAll('#urlExtractorPanel .url-group-item:not([style*="display: none"])').forEach(li => {
+            // Extract only the URL/value part, excluding label and timestamp
+            const valueMatch = li.innerText.match(/:\s*(.*?)\s*\(\d{1,2}:\d{2}:\d{2}\s*(?:AM|PM)\)/);
+            if (valueMatch && valueMatch[1]) {
+                urls.push(valueMatch[1]);
+            } else {
+                urls.push(li.innerText); // Fallback if regex fails
+            }
+        });
+        const textToCopy = urls.join('\n');
+
+        if (!textToCopy) return alert('No URLs to copy.');
+
+        navigator.clipboard.writeText(textToCopy)
+            .then(() => alert('Copied to clipboard!'))
+            .catch(err => {
+                console.error('[Copy Error]', err);
+                const textArea = document.createElement("textarea");
+                textArea.value = textToCopy;
+                textArea.style.position = 'fixed';
+                textArea.style.top = '0';
+                textArea.style.left = '0';
+                textArea.style.width = '1px';
+                textArea.style.height = '1px';
+                textArea.style.opacity = '0';
+                document.body.appendChild(textArea);
+                textArea.focus();
+                textArea.select();
+                try {
+                    document.execCommand('copy');
+                    alert('Copied to clipboard (fallback)!');
+                } catch (e) {
+                    alert('Failed to copy. Please copy manually from the panel.');
+                }
+                document.body.removeChild(textArea);
+            });
+    }
+
+    // Renders all current groups and their items into the panel
+    function renderGroups() {
+        const container = document.getElementById('urlGroupsContainer');
+        if (!container) return;
+        container.innerHTML = ''; // Clear existing
+        groupsData.forEach((group, index) => {
+            const groupDiv = document.createElement('div');
+            groupDiv.className = 'url-group';
+            groupDiv.dataset.groupId = index;
+
+            const header = document.createElement('div');
+            header.className = 'url-group-header';
+            header.innerHTML = `
+                <span>${group.type.toUpperCase()}: ${group.mainUrl.length > 50 ? group.mainUrl.substring(0, 47) + '...' : group.mainUrl}</span>
+                <span class="arrow">${group.isExpanded ? '&#9660;' : '&#9654;'}</span>
+            `;
+            header.onclick = () => {
+                group.isExpanded = !group.isExpanded;
+                renderGroups(); // Re-render to reflect expanded state
+            };
+            groupDiv.appendChild(header);
+
+            const contentList = document.createElement('ul');
+            contentList.className = `url-group-content ${group.isExpanded ? 'expanded' : ''}`;
+
+            group.items.forEach(item => {
+                const li = document.createElement('li');
+                li.className = 'url-group-item';
+                li.dataset.type = item.type;
+                li.style.color = item.color;
+                li.innerHTML = `<strong>${item.label}:</strong> ${item.value} <span style="font-size:0.8em;color:#999;">(${item.timestamp})</span>`;
+                li.setAttribute('role', 'listitem');
+                li.setAttribute('tabindex', '0');
+
+                // Add headers section if available
+                if (item.headers && Object.keys(item.headers).length > 0) {
+                    const headersDetails = document.createElement('details');
+                    headersDetails.style.marginTop = '5px';
+                    headersDetails.style.backgroundColor = '#f8f9fa';
+                    headersDetails.style.borderRadius = '4px';
+                    headersDetails.style.padding = '5px';
+                    headersDetails.style.border = '1px solid #eee';
+
+                    const headersSummary = document.createElement('summary');
+                    headersSummary.style.fontWeight = 'bold';
+                    headersSummary.style.cursor = 'pointer';
+                    headersSummary.textContent = 'Response Headers';
+                    headersDetails.appendChild(headersSummary);
+
+                    const headersList = document.createElement('ul');
+                    headersList.style.listStyle = 'none';
+                    headersList.style.padding = '0';
+                    headersList.style.margin = '5px 0 0 0';
+
+                    let headersText = '';
+                    for (const headerName in item.headers) {
+                        const headerValue = item.headers[headerName];
+                        const headerLi = document.createElement('li');
+                        headerLi.style.wordBreak = 'break-all';
+                        headerLi.style.padding = '2px 0';
+                        headerLi.innerHTML = `<strong>${headerName}:</strong> ${headerValue}`;
+                        headersList.appendChild(headerLi);
+                        headersText += `${headerName}: ${headerValue}\n`;
+                    }
+                    headersDetails.appendChild(headersList);
+
+                    // Add a copy button for headers
+                    const copyHeadersBtn = document.createElement('button');
+                    copyHeadersBtn.textContent = 'Copy Headers';
+                    copyHeadersBtn.style.cssText = `
+                        margin-top: 8px; padding: 4px 8px; font-size: 11px;
+                        border: 1px solid #ddd; border-radius: 4px; background-color: #e9ecef;
+                        cursor: pointer;
+                    `;
+                    copyHeadersBtn.onclick = (e) => {
+                        e.stopPropagation(); // Prevent parent li click
+                        navigator.clipboard.writeText(headersText)
+                            .then(() => alert('Copied headers to clipboard!'))
+                            .catch(err => console.error('[Headers Copy Error]', err));
+                    };
+                    headersDetails.appendChild(copyHeadersBtn);
+
+                    li.appendChild(headersDetails);
+                }
+
+                li.addEventListener('click', () => {
+                    navigator.clipboard.writeText(item.value)
+                        .then(() => alert('Copied item to clipboard!'))
+                        .catch(err => console.error('[Item Copy Error]', err));
+                });
+                li.addEventListener('keydown', e => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        li.click();
+                    }
+                });
+                contentList.appendChild(li);
+            });
+            groupDiv.appendChild(contentList);
+            container.prepend(groupDiv); // Prepend to show newest on top
+        });
+
+        // Render any "Unassociated" items
+        const unassociatedGroup = groupsData.find(g => g.type === 'unassociated');
+        if (unassociatedGroup) {
+            const unassociatedDiv = document.createElement('div');
+            unassociatedDiv.className = 'url-group unassociated-group';
+            unassociatedDiv.dataset.groupId = 'unassociated';
+
+            const header = document.createElement('div');
+            header.className = 'url-group-header';
+            header.innerHTML = `
+                <span>Unassociated URLs & Data (${unassociatedGroup.items.length})</span>
+                <span class="arrow">${unassociatedGroup.isExpanded ? '&#9660;' : '&#9654;'}</span>
+            `;
+            header.onclick = () => {
+                unassociatedGroup.isExpanded = !unassociatedGroup.isExpanded;
+                renderGroups();
+            };
+            unassociatedDiv.appendChild(header);
+
+            const contentList = document.createElement('ul');
+            contentList.className = `url-group-content ${unassociatedGroup.isExpanded ? 'expanded' : ''}`;
+
+            unassociatedGroup.items.forEach(item => {
+                const li = document.createElement('li');
+                li.className = 'url-group-item';
+                li.dataset.type = item.type;
+                li.style.color = item.color;
+                li.innerHTML = `<strong>${item.label}:</strong> ${item.value} <span style="font-size:0.8em;color:#999;">(${item.timestamp})</span>`;
+                li.setAttribute('role', 'listitem');
+                li.setAttribute('tabindex', '0');
+
+                // Add headers section if available for unassociated items too
+                if (item.headers && Object.keys(item.headers).length > 0) {
+                    const headersDetails = document.createElement('details');
+                    headersDetails.style.marginTop = '5px';
+                    headersDetails.style.backgroundColor = '#f8f9fa';
+                    headersDetails.style.borderRadius = '4px';
+                    headersDetails.style.padding = '5px';
+                    headersDetails.style.border = '1px solid #eee';
+
+                    const headersSummary = document.createElement('summary');
+                    headersSummary.style.fontWeight = 'bold';
+                    headersSummary.style.cursor = 'pointer';
+                    headersSummary.textContent = 'Response Headers';
+                    headersDetails.appendChild(headersSummary);
+
+                    const headersList = document.createElement('ul');
+                    headersList.style.listStyle = 'none';
+                    headersList.style.padding = '0';
+                    headersList.style.margin = '5px 0 0 0';
+
+                    let headersText = '';
+                    for (const headerName in item.headers) {
+                        const headerValue = item.headers[headerName];
+                        const headerLi = document.createElement('li');
+                        headerLi.style.wordBreak = 'break-all';
+                        headerLi.style.padding = '2px 0';
+                        headerLi.innerHTML = `<strong>${headerName}:</strong> ${headerValue}`;
+                        headersList.appendChild(headerLi);
+                        headersText += `${headerName}: ${headerValue}\n`;
+                    }
+                    headersDetails.appendChild(headersList);
+
+                    const copyHeadersBtn = document.createElement('button');
+                    copyHeadersBtn.textContent = 'Copy Headers';
+                    copyHeadersBtn.style.cssText = `
+                        margin-top: 8px; padding: 4px 8px; font-size: 11px;
+                        border: 1px solid #ddd; border-radius: 4px; background-color: #e9ecef;
+                        cursor: pointer;
+                    `;
+                    copyHeadersBtn.onclick = (e) => {
+                        e.stopPropagation();
+                        navigator.clipboard.writeText(headersText)
+                            .then(() => alert('Copied headers to clipboard!'))
+                            .catch(err => console.error('[Headers Copy Error]', err));
+                    };
+                    headersDetails.appendChild(copyHeadersBtn);
+
+                    li.appendChild(headersDetails);
+                }
+
+                li.addEventListener('click', () => {
+                    navigator.clipboard.writeText(item.value)
+                        .then(() => alert('Copied item to clipboard!'))
+                        .catch(err => console.error('[Item Copy Error]', err));
+                });
+                li.addEventListener('keydown', e => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        li.click();
+                    }
+                });
+                contentList.appendChild(li);
+            });
+            unassociatedDiv.appendChild(contentList);
+            container.append(unassociatedDiv); // Append unassociated group to the end
+        }
+        filterURLs(document.querySelector('.filter-btn.active')?.dataset.filter || 'all');
+    }
+
+    // Appends a new item to the URL list, grouping it by manifest or to an "unassociated" group
+    function appendItem(label, value, type, color = '#000', manifestUrl = null, headers = null) { // Added headers parameter
+        if (loggedURLs.has(value)) return;
+        loggedURLs.add(value);
+
+        const newItem = {
+            label,
+            value,
+            type,
+            color,
+            timestamp: new Date().toLocaleTimeString(),
+            headers: headers // Store headers here
+        };
+
+        let targetGroup = null;
+
+        if (manifestUrl) {
+            // Find an existing group for this manifest URL
+            targetGroup = groupsData.find(g => g.mainUrl === manifestUrl);
+            if (!targetGroup) {
+                // If not found, create a new group
+                targetGroup = {
+                    mainUrl: manifestUrl,
+                    type: type, // mpd or m3u8
+                    items: [],
+                    isExpanded: true // New groups are expanded by default
+                };
+                groupsData.unshift(targetGroup); // Add to the beginning
+                // Limit the number of groups
+                if (groupsData.length > MAX_GROUPS) {
+                    groupsData.pop(); // Remove the oldest group
+                }
+            }
+            currentManifestGroup = targetGroup; // Set as current active group
+        } else if (currentManifestGroup && currentManifestGroup.items.length < MAX_URLS_PER_GROUP) {
+            // If no explicit manifest URL, but there's a recent group and it's not full
+            targetGroup = currentManifestGroup;
+        } else {
+            // If no recent manifest or current group is full, add to "unassociated"
+            targetGroup = groupsData.find(g => g.type === 'unassociated');
+            if (!targetGroup) {
+                targetGroup = {
+                    mainUrl: 'N/A',
+                    type: 'unassociated',
+                    items: [],
+                    isExpanded: true
+                };
+                groupsData.push(targetGroup); // Add to the end
+            }
+        }
+
+        if (targetGroup) {
+            targetGroup.items.unshift(newItem); // Add new item to the top of its group
+            // Limit items per group
+            if (targetGroup.items.length > MAX_URLS_PER_GROUP) {
+                targetGroup.items.pop();
+            }
+        }
+
+        renderGroups(); // Re-render the UI
+    }
+
+    // Logs a URL if it matches any pattern (for non-network requests like media elements)
+    function logURL(method, url) {
+        if (typeof url !== 'string' || !url.trim() || url.startsWith('data:')) return;
+
+        const patterns = [...urlPatterns, customPattern].filter(Boolean);
+        const isManifest = /\.mpd(\?|$)/i.test(url) || /\.m3u8(\?|$)/i.test(url);
+        const isLicense = /license.*\.(com|net|org|io|tv|video|api)|widevine|playready|fairplay/i.test(url);
+
+        if (patterns.some(p => p.test(url))) {
+            let type = 'other';
+            let color = '#000';
+            if (isManifest) {
+                type = /\.mpd(\?|$)/i.test(url) ? 'mpd' : 'm3u8';
+                color = type === 'mpd' ? '#007bff' : '#28a745';
+                appendItem(type.toUpperCase(), url, type, color, url);
+            } else if (isLicense) {
+                type = 'license';
+                color = '#dc3545';
+                appendItem('License', url, type, color);
+            } else {
+                appendItem(method, url, type, color);
+            }
+        } else if (debugEnabled) {
+            appendItem('Skipped', url, 'debug', '#6c757d');
+        }
+    }
+
+    // Parses PSSH data from an ArrayBuffer (e.g., from MP4 boxes)
+    function parsePSSH(data) {
+        if (!(data instanceof ArrayBuffer) || data.byteLength < 12) return null;
+        const view = new DataView(data);
+        const size = view.getUint32(0, false);
+        const boxType = String.fromCharCode(view.getUint8(4), view.getUint8(5), view.getUint8(6), view.getUint8(7));
+        if (size !== view.byteLength || boxType !== 'pssh') return null;
+
+        const version = view.getUint8(8);
+        const systemId = new Uint8Array(data.slice(12, 28));
+        const widevineUUID = 'edef8ba979d64acea3c827dcd51d21ed';
+
+        if (Array.from(systemId).map(b => b.toString(16).padStart(2, '0')).join('') === widevineUUID) {
+            let keyIds = null;
+            if (version === 1) {
+                const KIDsCount = view.getUint32(28, false);
+                let offset = 32;
+                keyIds = [];
+                for (let i = 0; i < KIDsCount; i++) {
+                    if (offset + 16 <= view.byteLength) {
+                        const keyId = new Uint8Array(data.slice(offset, offset + 16));
+                        keyIds.push(Array.from(keyId).map(b => b.toString(16).padStart(2, '0')).join(''));
+                        offset += 16;
+                    }
+                }
+            }
+            return { system: 'Widevine', keyIds };
+        }
+        return null;
+    }
+
+    // Scans text or ArrayBuffer data for PSSH XML tags or raw PSSH box data
+    function scanForPSSH(data, method) {
+        if (!data) return;
+
+        // 1. Scan for XML-encoded PSSH (e.g., in MPD manifests)
+        try {
+            const text = typeof data === 'string' ? data : new TextDecoder('utf-8', { fatal: false }).decode(data);
+            const matches = text.match(/<cenc:pssh>([^<]+)<\/cenc:pssh>/g) || [];
+            matches.forEach(match => {
+                const base64 = match.replace(/<\/?cenc:pssh>/g, '');
+                if (isValidBase64(base64)) {
+                    appendItem(`PSSH (${method})`, base64, 'pssh', '#800080');
+                    try {
+                        const binary = atob(base64);
+                        const psshArrayBuffer = new Uint8Array(binary.length);
+                        for (let i = 0; i < binary.length; i++) psshArrayBuffer[i] = binary.charCodeAt(i);
+                        const parsed = parsePSSH(psshArrayBuffer.buffer);
+                        if (parsed && parsed.keyIds && parsed.keyIds.length) {
+                            appendItem(`Widevine Key IDs (${method})`, parsed.keyIds.join(', '), 'pssh', '#9932CC');
+                        }
+                    } catch (e) {
+                        if (debugEnabled) console.warn('[PSSH Base64 Decode/Parse Error]', e);
+                    }
+                }
+            });
+        } catch (error) {
+            if (debugEnabled) console.warn('[PSSH XML Scan Error]:', error);
+        }
+
+        // 2. Scan for raw PSSH boxes within binary data (e.g., fMP4 init segments)
+        if (data instanceof ArrayBuffer) {
+            try {
+                const view = new DataView(data);
+                let offset = 0;
+                while (offset + 8 <= view.byteLength) {
+                    const size = view.getUint32(offset, false);
+                    const type = String.fromCharCode(view.getUint8(offset + 4), view.getUint8(offset + 5), view.getUint8(offset + 6), view.getUint8(offset + 7));
+                    if (type === 'pssh' && size >= 20 && offset + size <= view.byteLength) {
+                        const psshBoxData = data.slice(offset, offset + size);
+                        const base64 = btoa(String.fromCharCode(...new Uint8Array(psshBoxData)));
+                        if (isValidBase64(base64)) {
+                            appendItem(`Raw PSSH (${method})`, base64, 'pssh', '#800080');
+                            const parsed = parsePSSH(psshBoxData);
+                            if (parsed && parsed.keyIds && parsed.keyIds.length) {
+                                appendItem(`Widevine Key IDs (${method})`, parsed.keyIds.join(', '), 'pssh', '#9932CC');
+                            }
+                        }
+                    }
+                    offset += size;
+                    if (size === 0) break;
+                }
+            } catch (error) {
+                if (debugEnabled) console.warn('[PSSH Binary Scan Error]:', error);
+            }
+        }
+    }
+
+    // Sets up MutationObserver and PerformanceObserver
+    function setupObservers() {
+        if (mutationObserver) mutationObserver.disconnect();
+        mutationObserver = new MutationObserver(mutations => {
+            mutations.forEach(mutation => {
+                mutation.addedNodes.forEach(node => {
+                    if (node.tagName === 'VIDEO' || node.tagName === 'AUDIO') {
+                        if (node.src) logURL('Media Element', node.src);
+                        node.querySelectorAll('source').forEach(source => {
+                            if (source.src) logURL('Media Source', source.src);
+                        });
+                    }
+                });
+            });
+        });
+        mutationObserver.observe(document.documentElement, { childList: true, subtree: true });
+
+        if (window.PerformanceObserver) {
+            if (performanceObserver) performanceObserver.disconnect();
+            performanceObserver = new PerformanceObserver(list => {
+                list.getEntries().forEach(entry => {
+                    // Only log resource types not handled by fetch/XHR interceptors, as they provide headers.
+                    if (entry.initiatorType === 'img' || entry.initiatorType === 'script' || entry.initiatorType === 'link' || entry.initiatorType === 'css') {
+                        logURL(entry.initiatorType.toUpperCase(), entry.name);
+                    }
+                });
+            });
+            performanceObserver.observe({ entryTypes: ['resource'] });
+        }
+    }
+
+    // Intercept Fetch API calls
+    const originalFetch = window.fetch;
+    window.fetch = async function(input, init) {
+        const url = typeof input === 'string' ? input : (input && input.url ? input.url : '');
+        const loading = document.getElementById('loading');
+        if (loading) loading.style.display = 'block';
+
+        try {
+            const response = await originalFetch(input, init);
+            const clonedResponse = response.clone(); // Clone before reading body
+
+            // Extract headers
+            const responseHeaders = {};
+            response.headers.forEach((value, name) => {
+                responseHeaders[name] = value;
+            });
+
+            // Determine type and color for display
+            let type = 'fetch';
+            let color = '#6f42c1'; // Purple for fetch/XHR
+            const isManifest = /\.mpd(\?|$)/i.test(url) || /\.m3u8(\?|$)/i.test(url);
+            const isLicense = /license.*\.(com|net|org|io|tv|video|api)|widevine|playready|fairplay/i.test(url);
+
+            if (isManifest) {
+                type = /\.mpd(\?|$)/i.test(url) ? 'mpd' : 'm3u8';
+                color = type === 'mpd' ? '#007bff' : '#28a745';
+                appendItem(type.toUpperCase(), url, type, color, url, responseHeaders); // Pass URL as manifestUrl
+            } else if (isLicense) {
+                type = 'license';
+                color = '#dc3545';
+                appendItem('License', url, type, color, null, responseHeaders);
+            } else {
+                // Only append if it matches custom pattern or is a standard network request, or if debug is on
+                const patterns = [...urlPatterns, customPattern].filter(Boolean);
+                if (patterns.some(p => p.test(url)) || debugEnabled) {
+                    appendItem('Fetch', url, type, color, null, responseHeaders);
+                }
+            }
+
+            if (response.ok) {
+                clonedResponse.arrayBuffer()
+                    .then(buffer => scanForPSSH(buffer, 'Fetch'))
+                    .catch(e => {
+                        if (debugEnabled) console.warn('Fetch response body (ArrayBuffer) error:', e);
+                    });
+            } else {
+                if (debugEnabled) {
+                    appendItem('Fetch Error', `${url} (Status: ${response.status})`, 'error', '#dc3545');
+                }
+            }
+            return response;
+        } catch (error) {
+            if (debugEnabled) {
+                console.error('Fetch Error:', `URL: ${url}`, error);
+                appendItem('Fetch Error', url, 'error', '#dc3545');
+            }
+            throw error;
+        } finally {
+            if (loading) loading.style.display = 'none';
+        }
+    };
+
+    // Intercept XMLHttpRequest calls
+    const originalXhrOpen = XMLHttpRequest.prototype.open;
+    const originalXhrSend = XMLHttpRequest.prototype.send;
+
+    XMLHttpRequest.prototype.open = function(method, url) {
+        this._url = url; // Store URL for later use in send's load listener
+        originalXhrOpen.apply(this, arguments);
+    };
+
+    XMLHttpRequest.prototype.send = function() {
+        const loading = document.getElementById('loading');
+        if (loading) loading.style.display = 'block';
+
+        this.addEventListener('load', function() {
+            try {
+                const url = this._url;
+                const responseHeaders = {};
+                if (this.getAllResponseHeaders) { // Check if method exists
+                    const rawHeaders = this.getAllResponseHeaders();
+                    rawHeaders.split('\r\n').forEach(line => {
+                        const parts = line.split(': ', 2);
+                        if (parts.length === 2) {
+                            responseHeaders[parts[0].toLowerCase()] = parts[1];
+                        }
+                    });
+                }
+
+                // Determine type and color for display
+                let type = 'xhr';
+                let color = '#6f42c1'; // Purple for fetch/XHR
+                const isManifest = /\.mpd(\?|$)/i.test(url) || /\.m3u8(\?|$)/i.test(url);
+                const isLicense = /license.*\.(com|net|org|io|tv|video|api)|widevine|playready|fairplay/i.test(url);
+
+                if (this.status >= 200 && this.status < 300) {
+                    if (isManifest) {
+                        type = /\.mpd(\?|$)/i.test(url) ? 'mpd' : 'm3u8';
+                        color = type === 'mpd' ? '#007bff' : '#28a745';
+                        appendItem(type.toUpperCase(), url, type, color, url, responseHeaders); // Pass URL as manifestUrl
+                    } else if (isLicense) {
+                        type = 'license';
+                        color = '#dc3545';
+                        appendItem('License', url, type, color, null, responseHeaders);
+                    } else {
+                        // Only append if it matches custom pattern or is a standard network request, or if debug is on
+                        const patterns = [...urlPatterns, customPattern].filter(Boolean);
+                        if (patterns.some(p => p.test(url)) || debugEnabled) {
+                            appendItem('XHR', url, type, color, null, responseHeaders);
+                        }
+                    }
+
+                    if (this.responseType === '' || this.responseType === 'text') {
+                        if (this.responseText) scanForPSSH(this.responseText, 'XHR');
+                    } else if (this.responseType === 'arraybuffer' && this.response) {
+                        scanForPSSH(this.response, 'XHR');
+                    }
+                } else {
+                    if (debugEnabled) {
+                        appendItem('XHR Error', `${url} (Status: ${this.status})`, 'error', '#dc3545');
+                    }
+                }
+            } catch (e) {
+                if (debugEnabled) console.error('XHR Load Error:', e);
+            } finally {
+                if (loading) loading.style.display = 'none';
+            }
+        });
+        this.addEventListener('error', function() {
+            if (debugEnabled) {
+                console.error('XHR Network Error:', this._url);
+                appendItem('XHR Error', this._url, 'error', '#dc3545');
+            }
+            if (loading) loading.style.display = 'none';
+        });
+        originalXhrSend.apply(this, arguments);
+    };
+
+    // Ensure panel creation and observer setup on various document states and events
+    function initializeScript() {
+        if (document.readyState === 'interactive' || document.readyState === 'complete') {
+            createPanel();
+            setupObservers();
+        } else {
+            document.addEventListener('DOMContentLoaded', () => {
+                createPanel();
+                setupObservers();
+            });
+        }
+
+        window.addEventListener('load', () => {
+            createPanel();
+            setupObservers();
+        });
+        window.addEventListener('popstate', () => {
+            // Clear and re-initialize on popstate for better SPA support
+            clearURLs(); // This also calls setupObservers()
+            createPanel(); // Ensure panel is present
+        });
+        window.addEventListener('hashchange', () => {
+            // For hash-based routing in SPAs
+            clearURLs(); // This also calls setupObservers()
+            createPanel(); // Ensure panel is present
+        });
+    }
+
+    initializeScript();
+})();
+
